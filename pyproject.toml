@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "harness-sync"
+version = "0.1.0"
+description = "Sync Codex and Claude defaults between local and SSH machines"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+authors = [{ name = "Lan Zongwei", email = "i@soullan.com" }]
+keywords = ["codex", "claude", "ssh", "configuration"]
+
+[project.scripts]
+harness-sync = "harness_sync:main"
+
+[project.urls]
+Repository = "https://github.com/Ghost-LZW/harness-sync"
+Issues = "https://github.com/Ghost-LZW/harness-sync/issues"
+
+[tool.setuptools]
+py-modules = ["harness_sync"]
