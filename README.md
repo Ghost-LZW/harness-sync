@@ -76,6 +76,25 @@ A harness-specific key takes precedence over a shared key. An explicit key takes
 
 For Codex, custom-key mode requires a custom `model_provider` in the source configuration. It writes the key to the target's `api-key` file and sets that provider's `auth` command to `/bin/cat` with the target path. This requires a Codex version supporting provider `auth` commands. For Claude, it sets `env.ANTHROPIC_AUTH_TOKEN` in `settings.json` and removes a conflicting `ANTHROPIC_API_KEY` or `apiKeyHelper` setting. Provider URLs come from the source configuration. Exported variables or wrapper scripts outside these files can still override harness behavior.
 
+## Refresh Codex models before launch
+
+If your source Codex directory contains a trusted `refresh-models.py`, opt in to copying it and creating a launcher:
+
+```sh
+harness-sync sync --to devbox --harness codex --with-model-refresh
+harness-sync sync --to devbox --harness codex --with-model-refresh --apply
+
+# On devbox: refresh the catalog, then start Codex with your arguments.
+~/.local/bin/codex-with-models
+~/.local/bin/codex-with-models --version
+```
+
+This copies `refresh-models.py` byte-for-byte into the target's Codex directory and installs `~/.local/bin/codex-with-models` with mode `0700`. The launcher sets `CODEX_HOME` to the synchronized directory, runs the script using the target's Python, and forwards all arguments to the existing Codex CLI. It uses `~/.local/bin/codex` when executable, otherwise a `codex` found on the target's PATH. It preserves the original CLI entry, so package-manager updates can continue to replace it. Use the full launcher path when `~/.local/bin` is absent from PATH. Ordinary `codex` does not run this launcher.
+
+This is an explicit code-transfer option: inspect and trust the source script. No refresh script is bundled or executed by `harness-sync`; it runs later when you use the launcher. The script must be portable and compatible with the target's provider, credentials, Python, and CLI installation. Its own return code controls launch behavior: zero starts Codex, nonzero stops. A script that returns zero after retaining a valid cached catalog can allow startup when discovery is temporarily unavailable.
+
+The source must select `model_catalog_json`, and Codex must already be installed on the target. Credentials are still opt-in through `--with-secrets` or custom-key options. The source script is required, not an existing source launcher: each destination launcher is generated for that machine. Script and launcher updates are backed up and restored like configuration files. Omit `--with-model-refresh` to leave them alone; this option does not add cron jobs or modify shell profiles. Model lists may differ between CLI versions when the refresh script requests a version-specific catalog.
+
 ## What gets synchronized
 
 The source controls portable defaults. Stale portable settings on the target are removed; machine-specific sections stay on that target. This includes permission and sandbox defaults: syncing a source configured with broad permissions carries those choices to the destination. Preview first.
@@ -85,6 +104,7 @@ The source controls portable defaults. Stale portable settings on the target are
 | Codex `config.toml` | Model, reasoning effort, service tier, provider definitions, approval/sandbox defaults, portable features, profiles, other defaults | `projects`, `desktop`, `marketplaces`, `plugins`, `mcp_servers`, `hooks`, `notify`, `tui`; the hooks feature switch |
 | Claude `settings.json` | Model, model settings, environment defaults, permissions, UI/update preferences, other defaults | `hooks`, `enabledPlugins`, `extraKnownMarketplaces`, `skillOverrides` |
 | Codex model catalog | The JSON file referenced by `model_catalog_json`, normalized to `models.json` on the destination | Unreferenced catalogs |
+| Codex refresh helper | Source `refresh-models.py` and a generated `codex-with-models` launcher only with `--with-model-refresh` | Existing helpers when the flag is omitted |
 | Credentials | Supported inline credentials and files only with `--with-secrets`, or a selected custom API key | Target credentials by default |
 
 Supported credential files are Codex `api-key`, Codex `auth.json`, and Claude `.credentials.json`. Keychain entries, browser logins, shell environment files, arbitrary files used by an auth command, and external secret helpers are not copied. Without `--with-secrets`, secret-like settings retain their corresponding target values; source-only secret-like settings are omitted. Arbitrary secrets in unusually named fields cannot be identified reliably. Treat configuration files as private.
@@ -107,7 +127,7 @@ harness-sync restore --target devbox --backup BACKUP_ID --apply
 
 Backups live on the destination under `${XDG_STATE_HOME:-~/.local/state}/harness-sync/backups/`. Each backup records the prior content and which files did not exist. Restoring removes files created by the original sync and creates a new backup so the restore can itself be undone. Backup IDs are machine-local. No automatic pruning is performed.
 
-Files are written with mode `0600`; backup directories use `0700`. The tool checks for concurrent edits before writing, serializes its own writes with a destination lock, and uses atomic replacement for each file. If a normal write fails, it attempts to roll back that destination. A process kill, power loss, or a writer ignoring the lock can still interrupt a multi-file operation; use the backup to recover. Symlink configuration files are rejected rather than replaced.
+Configuration files and refresh scripts are written with mode `0600`; the optional executable launcher and backup directories use `0700`. The tool checks for concurrent edits before writing, serializes its own writes with a destination lock, and uses atomic replacement for each file. If a normal write fails, it attempts to roll back that destination. A process kill, power loss, or a writer ignoring the lock can still interrupt a multi-file operation; use the backup to recover. Symlink configuration files are rejected rather than replaced.
 
 ## Privacy
 
@@ -123,7 +143,7 @@ python3 -m pip install .
 harness-sync --version
 ```
 
-Tests cover credential opt-in, custom keys, path mapping, stale-default removal, machine-specific preservation, preview privacy, idempotence, backups/restores, concurrent edits, rollback, TOML round trips, and the SSH worker protocol. CI runs on macOS and Linux with Python 3.11 and 3.13.
+Tests cover credential opt-in, custom keys, path mapping, stale-default removal, machine-specific preservation, preview privacy, idempotence, backups/restores, concurrent edits, rollback, TOML round trips, the SSH worker protocol, and model-refresh launch order, failure handling, and argument/path quoting. CI runs on macOS and Linux with Python 3.11 and 3.13.
 
 Codex user-default behavior: [official configuration documentation](https://developers.openai.com/codex/config-basic/).
 

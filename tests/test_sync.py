@@ -191,6 +191,76 @@ class SyncTests(unittest.TestCase):
         result = hs.protect_secrets(source, {}, False)
         self.assertEqual(result, {"max_tokens": 1000, "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "10000"})
 
+    def model_refresh_plan(self):
+        script = self.source / ".codex/refresh-models.py"
+        script.write_text(
+            "import os, pathlib\n"
+            "pathlib.Path(os.environ['CODEX_HOME'], 'refreshed').write_text('yes')\n"
+        )
+        binary = self.target / ".local/bin/codex"
+        binary.parent.mkdir(parents=True, exist_ok=True)
+        binary.write_text(
+            '#!/bin/sh\n'
+            '[ -f "$CODEX_HOME/refreshed" ] || exit 42\n'
+            'printf \'%s\\n\' "$@"\n'
+        )
+        binary.chmod(0o700)
+        source = hs.inspect(str(self.source), model_refresh=True)
+        target = hs.inspect(str(self.target), model_refresh=True)
+        return hs.build_plan(source, target, model_refresh=True)
+
+    def test_model_refresh_is_explicit_and_does_not_replace_cli(self):
+        plan = self.model_refresh_plan()
+        self.assertIn("codex/refresh-models.py", plan["writes"])
+        self.assertIn("bin/codex-with-models", plan["writes"])
+        self.assertNotIn("codex/refresh-models.py", self.plan()["writes"])
+        binary = self.target / ".local/bin/codex"
+        original = binary.read_bytes()
+        result = hs.apply_plan(plan, str(self.target))
+        launcher = self.target / ".local/bin/codex-with-models"
+        self.assertEqual(launcher.stat().st_mode & 0o777, 0o700)
+        completed = subprocess.run([str(launcher), "arg with spaces", "--example"], capture_output=True, text=True)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(completed.stdout.splitlines(), ["arg with spaces", "--example"])
+        self.assertEqual(binary.read_bytes(), original)
+        source = hs.inspect(str(self.source), model_refresh=True)
+        target = hs.inspect(str(self.target), model_refresh=True)
+        self.assertEqual(hs.build_plan(source, target, model_refresh=True)["writes"], {})
+        hs.apply_plan(hs.restore_plan(result["backup"], str(self.target)), str(self.target))
+        self.assertFalse(launcher.exists())
+        self.assertFalse((self.target / ".codex/refresh-models.py").exists())
+        self.assertEqual(binary.read_bytes(), original)
+
+    def test_launcher_does_not_start_codex_if_refresh_fails(self):
+        plan = self.model_refresh_plan()
+        plan["writes"]["codex/refresh-models.py"] = hs.encode(b"raise SystemExit(19)\n")
+        hs.apply_plan(plan, str(self.target))
+        launcher = self.target / ".local/bin/codex-with-models"
+        completed = subprocess.run([str(launcher)], capture_output=True, text=True)
+        self.assertEqual(completed.returncode, 19)
+        self.assertEqual(completed.stdout, "")
+
+    def test_launcher_quotes_target_paths(self):
+        self.target = Path(self.temp.name) / "target's folder"
+        (self.target / ".codex").mkdir(parents=True)
+        (self.target / ".claude").mkdir()
+        plan = self.model_refresh_plan()
+        hs.apply_plan(plan, str(self.target))
+        completed = subprocess.run([str(self.target / ".local/bin/codex-with-models"), "quoted argument"], capture_output=True, text=True)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(completed.stdout.strip(), "quoted argument")
+
+    def test_model_refresh_requires_script_and_target_cli(self):
+        source = self.snapshot(self.source)
+        target = self.snapshot(self.target)
+        with self.assertRaisesRegex(hs.SyncError, "refresh-models.py is missing"):
+            hs.build_plan(source, target, model_refresh=True)
+        source["files"]["codex/refresh-models.py"] = hs.encode(b"pass\n")
+        with self.assertRaisesRegex(hs.SyncError, "Codex CLI"):
+            hs.build_plan(source, target, model_refresh=True)
+        with self.assertRaisesRegex(hs.SyncError, "requires the Codex"):
+            hs.build_plan(source, target, harness="claude", model_refresh=True)
+
     def test_symlinks_and_path_traversal_are_rejected(self):
         key = self.target / ".codex/api-key"
         key.symlink_to(self.source / ".codex/api-key")

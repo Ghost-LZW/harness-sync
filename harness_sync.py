@@ -21,7 +21,7 @@ import tomllib
 import uuid
 from urllib.parse import urlsplit
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 MAX_FILE = 16 * 1024 * 1024
 MACHINE_CODEX = {
     "projects", "desktop", "marketplaces", "plugins", "mcp_servers",
@@ -38,9 +38,11 @@ SECRET_KEY = re.compile(
 ALLOWED = {
     "codex/config.toml", "codex/models.json", "codex/api-key", "codex/auth.json",
     "claude/settings.json", "claude/.credentials.json",
+    "codex/refresh-models.py", "bin/codex-with-models",
 }
 CONFIGS = {"codex/config.toml", "claude/settings.json"}
 SENSITIVE_FILES = {"codex/api-key", "codex/auth.json", "claude/.credentials.json"}
+MODEL_REFRESH_FILES = {"codex/refresh-models.py", "bin/codex-with-models"}
 
 
 class SyncError(Exception):
@@ -72,7 +74,8 @@ def file_path(label, location):
     if label not in ALLOWED:
         raise SyncError("unsupported file label")
     harness, name = label.split("/", 1)
-    p = Path(location[harness]) / name
+    directory = Path(location["home"]) / ".local/bin" if harness == "bin" else Path(location[harness])
+    p = directory / name
     if p.is_symlink():
         raise SyncError(f"refusing symlink file: {label}")
     return p
@@ -190,11 +193,15 @@ def changed_keys(a, b, prefix=""):
     return [prefix] if a != b else []
 
 
-def inspect(home=None, harness="both", secrets=False, api_key=False, catalog=True):
+def inspect(home=None, harness="both", secrets=False, api_key=False, catalog=True, model_refresh=False):
     location = roots(home)
     files = {}
     for label in sorted(ALLOWED):
-        if harness != "both" and not label.startswith(harness + "/"):
+        if label in MODEL_REFRESH_FILES and not model_refresh:
+            continue
+        if harness == "claude" and label in MODEL_REFRESH_FILES:
+            continue
+        if harness != "both" and not label.startswith(harness + "/") and label not in MODEL_REFRESH_FILES:
             continue
         if label in SENSITIVE_FILES and not secrets and not (api_key and label == "codex/api-key"):
             continue
@@ -216,10 +223,23 @@ def inspect(home=None, harness="both", secrets=False, api_key=False, catalog=Tru
             except ValueError as e:
                 raise SyncError("invalid model catalog JSON") from e
             files["codex/models.json"] = encode(catalog)
-    return {"roots": location, "files": files}
+    result = {"roots": location, "files": files}
+    if model_refresh and harness != "claude":
+        # Preserve the original CLI entry so package upgrades still take effect.
+        binary = Path(location["home"]) / ".local/bin/codex"
+        if not binary.is_file() or not os.access(binary, os.X_OK):
+            import shutil
+            found = shutil.which("codex")
+            binary = Path(found) if found else None
+        if binary is not None:
+            if binary.resolve() == file_path("bin/codex-with-models", location).resolve():
+                raise SyncError("Codex binary points to the model-refresh launcher")
+            result["codex_binary"] = str(binary.absolute())
+        result["python"] = sys.executable
+    return result
 
 
-def build_plan(source, target, harness="both", secrets=False, api_keys=None):
+def build_plan(source, target, harness="both", secrets=False, api_keys=None, model_refresh=False):
     api_keys = api_keys or {}
     writes, changes = {}, {}
     for name, label in (("codex", "codex/config.toml"), ("claude", "claude/settings.json")):
@@ -278,6 +298,8 @@ def build_plan(source, target, harness="both", secrets=False, api_keys=None):
             parse_config(label, data)
             writes[label], changes[label] = data, keys
     for label, encoded in source["files"].items():
+        if label in MODEL_REFRESH_FILES:
+            continue
         if label in CONFIGS or (label in SENSITIVE_FILES and not secrets):
             continue
         if harness != "both" and not label.startswith(harness + "/"):
@@ -292,6 +314,33 @@ def build_plan(source, target, harness="both", secrets=False, api_keys=None):
         if encoded != target["files"].get(label):
             writes[label] = decode(encoded)
             changes[label] = ["content (values hidden)"]
+    if model_refresh:
+        if harness == "claude":
+            raise SyncError("--with-model-refresh requires the Codex harness")
+        script_label = "codex/refresh-models.py"
+        if script_label not in source["files"]:
+            raise SyncError("source refresh-models.py is missing from the Codex configuration directory")
+        if not target.get("codex_binary"):
+            raise SyncError("cannot find an executable Codex CLI on the target")
+        src = parse_config("codex/config.toml", decode(source["files"]["codex/config.toml"]))
+        if not src.get("model_catalog_json"):
+            raise SyncError("model refresh requires model_catalog_json in the source configuration")
+        script = decode(source["files"][script_label])
+        try:
+            compile(script, "refresh-models.py", "exec")
+        except (SyntaxError, ValueError) as e:
+            raise SyncError("source refresh-models.py is not valid Python") from e
+        location = target["roots"]
+        wrapper = (
+            '#!/bin/sh\nset -eu\n'
+            + "export CODEX_HOME=" + shlex.quote(location["codex"]) + "\n"
+            + shlex.quote(target["python"]) + " " + shlex.quote(str(Path(location["codex"]) / "refresh-models.py")) + "\n"
+            + "exec " + shlex.quote(target["codex_binary"]) + ' "$@"\n'
+        ).encode()
+        for label, data in ((script_label, script), ("bin/codex-with-models", wrapper)):
+            if encode(data) != target["files"].get(label):
+                writes[label] = data
+                changes[label] = ["model-refresh script" if label == script_label else "refresh before starting Codex"]
     return {
         "writes": {k: encode(v) for k, v in writes.items()},
         "expected": {k: digest(decode(target["files"][k])) if k in target["files"] else None for k in writes},
@@ -403,7 +452,7 @@ def apply_plan(plan, home=None):
                 if encoded is None:
                     p.unlink(missing_ok=True)
                 else:
-                    atomic_write(p, decode(encoded))
+                    atomic_write(p, decode(encoded), 0o700 if label == "bin/codex-with-models" else 0o600)
                 done.append(label)
         except BaseException:
             for label in reversed(done):
@@ -448,7 +497,7 @@ def restore_plan(backup_id, home=None):
 def worker(request):
     operation, home = request["operation"], request.get("home")
     if operation == "inspect":
-        return inspect(home, request.get("harness", "both"), request.get("secrets", False), request.get("api_key", False), request.get("catalog", True))
+        return inspect(home, request.get("harness", "both"), request.get("secrets", False), request.get("api_key", False), request.get("catalog", True), request.get("model_refresh", False))
     if operation == "apply":
         return apply_plan(request["plan"], home)
     if operation == "restore":
@@ -515,6 +564,7 @@ def cli(argv=None):
     sync.add_argument("--to", dest="targets", action="append", required=True)
     sync.add_argument("--harness", choices=["both", "codex", "claude"], default="both")
     sync.add_argument("--with-secrets", action="store_true", help="also transfer inline credentials and supported auth files")
+    sync.add_argument("--with-model-refresh", action="store_true", help="copy trusted refresh-models.py and install a codex-with-models launcher")
     for name, prefix in (("shared", ""), ("Codex", "codex-"), ("Claude", "claude-")):
         group = sync.add_mutually_exclusive_group()
         group.add_argument("--" + prefix + "api-key-env", metavar="VAR", help=f"read a custom {name} API key from a local environment variable")
@@ -529,10 +579,12 @@ def cli(argv=None):
     args = parser.parse_args(argv)
     try:
         if args.command == "sync":
+            if args.with_model_refresh and args.harness == "claude":
+                raise SyncError("--with-model-refresh requires the Codex harness")
             if args.source in args.targets:
                 raise SyncError("source and target must differ")
             targets = list(dict.fromkeys(args.targets))
-            request = {"operation": "inspect", "harness": args.harness, "secrets": args.with_secrets}
+            request = {"operation": "inspect", "harness": args.harness, "secrets": args.with_secrets, "model_refresh": args.with_model_refresh}
             source = call(args.source, request, args.local_home)
             api_keys = load_api_keys(args)
             if "codex" in api_keys and not args.with_secrets:
@@ -542,7 +594,7 @@ def cli(argv=None):
             # Preflight every target before the first write. Each target is transactional.
             for target in targets:
                 destination = call(target, {**request, "catalog": False}, args.local_home)
-                plan = build_plan(source, destination, args.harness, args.with_secrets, api_keys)
+                plan = build_plan(source, destination, args.harness, args.with_secrets, api_keys, args.with_model_refresh)
                 show_plan(target, plan)
                 plans.append((target, plan))
             if args.apply:
