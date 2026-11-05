@@ -21,7 +21,7 @@ import tomllib
 import uuid
 from urllib.parse import urlsplit
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 MAX_FILE = 16 * 1024 * 1024
 MACHINE_CODEX = {
     "projects", "desktop", "marketplaces", "plugins", "mcp_servers",
@@ -39,10 +39,14 @@ ALLOWED = {
     "codex/config.toml", "codex/models.json", "codex/api-key", "codex/auth.json",
     "claude/settings.json", "claude/.credentials.json",
     "codex/refresh-models.py", "bin/codex-with-models",
+    "shell/.zshrc", "shell/.bashrc", "home/.claude-ag-settings.json",
 }
 CONFIGS = {"codex/config.toml", "claude/settings.json"}
 SENSITIVE_FILES = {"codex/api-key", "codex/auth.json", "claude/.credentials.json"}
 MODEL_REFRESH_FILES = {"codex/refresh-models.py", "bin/codex-with-models"}
+# Written only by the launchers command; sync never reads or copies them.
+LAUNCHER_FILES = {"shell/.zshrc", "shell/.bashrc", "home/.claude-ag-settings.json"}
+LAUNCHER_MARK = "# agent launchers (harness-sync)"
 
 
 class SyncError(Exception):
@@ -74,7 +78,12 @@ def file_path(label, location):
     if label not in ALLOWED:
         raise SyncError("unsupported file label")
     harness, name = label.split("/", 1)
-    directory = Path(location["home"]) / ".local/bin" if harness == "bin" else Path(location[harness])
+    if harness == "bin":
+        directory = Path(location["home"]) / ".local/bin"
+    elif harness in ("shell", "home"):
+        directory = Path(location["home"])
+    else:
+        directory = Path(location[harness])
     p = directory / name
     if p.is_symlink():
         raise SyncError(f"refusing symlink file: {label}")
@@ -196,7 +205,7 @@ def changed_keys(a, b, prefix=""):
 def inspect(home=None, harness="both", secrets=False, api_key=False, catalog=True, model_refresh=False):
     location = roots(home)
     files = {}
-    for label in sorted(ALLOWED):
+    for label in sorted(ALLOWED - LAUNCHER_FILES):
         if label in MODEL_REFRESH_FILES and not model_refresh:
             continue
         if harness == "claude" and label in MODEL_REFRESH_FILES:
@@ -348,25 +357,27 @@ def build_plan(source, target, harness="both", secrets=False, api_keys=None, mod
     }
 
 
-def load_api_keys(args):
-    def load(env, filename):
-        if env:
-            value = os.environ.get(env)
-            if value is None:
-                raise SyncError("API key environment variable is not set")
-        elif filename:
-            p = Path(filename).expanduser()
-            data = read_file(p)
-            if data is None:
-                raise SyncError("API key file does not exist")
-            value = data.decode()
-        else:
-            return None
-        value = value.strip()
-        if not value or re.search(r"[\x00-\x20\x7f]", value):
-            raise SyncError("API key must be a single nonempty token")
-        return value
+def load_key(env, filename):
+    if env:
+        value = os.environ.get(env)
+        if value is None:
+            raise SyncError("API key environment variable is not set")
+    elif filename:
+        p = Path(filename).expanduser()
+        data = read_file(p)
+        if data is None:
+            raise SyncError("API key file does not exist")
+        value = data.decode()
+    else:
+        return None
+    value = value.strip()
+    if not value or re.search(r"[\x00-\x20\x7f]", value):
+        raise SyncError("API key must be a single nonempty token")
+    return value
 
+
+def load_api_keys(args):
+    load = load_key
     shared = load(args.api_key_env, args.api_key_file)
     result = {}
     for harness in ("codex", "claude"):
@@ -452,7 +463,13 @@ def apply_plan(plan, home=None):
                 if encoded is None:
                     p.unlink(missing_ok=True)
                 else:
-                    atomic_write(p, decode(encoded), 0o700 if label == "bin/codex-with-models" else 0o600)
+                    if label == "bin/codex-with-models":
+                        mode = 0o700
+                    elif label.startswith("shell/") and before[label] is not None:
+                        mode = modes[label]  # rc files keep their permissions
+                    else:
+                        mode = 0o600
+                    atomic_write(p, decode(encoded), mode)
                 done.append(label)
         except BaseException:
             for label in reversed(done):
@@ -494,8 +511,155 @@ def restore_plan(backup_id, home=None):
     return {"writes": writes, "expected": expected, "changes": changes}
 
 
+def reachable(url, timeout=5):
+    # Require an HTTP reply: some networks accept the TCP connection and then never answer.
+    import urllib.error
+    import urllib.request
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    try:
+        with opener.open(url.rstrip("/") + "/", timeout=timeout):
+            return True
+    except urllib.error.HTTPError:
+        return True  # any status code means the gateway answered
+    except (OSError, ValueError):
+        return False
+
+
+def shell_rc(home=None):
+    # The login shell decides which rc file interactive sessions (and the hub) read.
+    return "shell/.zshrc" if Path(os.environ.get("SHELL", "")).name == "zsh" else "shell/.bashrc"
+
+
+def inspect_launchers(home=None, gateways=(), provider="astergate"):
+    location = roots(home)
+    rc = shell_rc(home)
+    files = {}
+    for label in (rc, "codex/config.toml"):
+        data = read_file(file_path(label, location))
+        if data is not None:
+            files[label] = encode(data)
+    settings = Path(location["home"]) / ".claude-ag-settings.json"
+    present = {"home/.claude-ag-settings.json": settings.exists() or settings.is_symlink()}
+    for label in ("codex/api-key", "codex/models.json"):
+        p = Path(location["codex"]) / label.split("/", 1)[1]
+        present[label] = p.exists() and p.stat().st_size > 0
+    # The first gateway this machine can connect to wins (e.g. IPv4 before IPv6).
+    gateway = next((g for g in gateways if reachable(g)), None)
+    return {"roots": location, "rc": rc, "files": files, "present": present, "gateway": gateway}
+
+
+def launcher_aliases(provider, model):
+    return {
+        "claude-ag": "claude --dangerously-skip-permissions --settings ~/.claude-ag-settings.json",
+        # Codex 0.166+ rejects --profile when config.toml still has [profiles.*]; -c overrides work on every version.
+        "codex-ag": f'codex -c model_provider={provider} -c model={model} -c model_catalog_json="$HOME/.codex/models.json"',
+    }
+
+
+CLAUDE_LAUNCHER_MODELS = {
+    "main": "claude-opus-5-5",                   # default, opus, fable
+    "sonnet": "dsv41-flash-uncensored[1m]",      # sonnet and subagents
+    "haiku": "glm-5.3[1m]",                      # haiku and background tasks
+}
+
+
+def claude_launcher_settings(gateway, key, models=None):
+    m = {**CLAUDE_LAUNCHER_MODELS, **(models or {})}
+    return {
+        "env": {
+            "ANTHROPIC_BASE_URL": gateway,
+            "ANTHROPIC_AUTH_TOKEN": key,
+            "ANTHROPIC_MODEL": m["main"],
+            "ANTHROPIC_DEFAULT_OPUS_MODEL": m["main"],
+            "ANTHROPIC_DEFAULT_FABLE_MODEL": m["main"],
+            "ANTHROPIC_DEFAULT_SONNET_MODEL": m["sonnet"],
+            "CLAUDE_CODE_SUBAGENT_MODEL": m["sonnet"],
+            "ANTHROPIC_DEFAULT_HAIKU_MODEL": m["haiku"],
+            "ANTHROPIC_SMALL_FAST_MODEL": m["haiku"],
+            "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY": "1",
+        },
+        "permissions": {"defaultMode": "bypassPermissions"},
+    }
+
+
+def build_launcher_plan(target, claude_key=None, codex_key=None, catalog=None, provider="astergate", model="gpt-6.1-sol", claude_models=None):
+    gateway = target.get("gateway")
+    if not gateway:
+        raise SyncError("no gateway is reachable from this machine")
+    gateway = gateway.rstrip("/")
+    location = target["roots"]
+    writes, changes = {}, {}
+    if not target["present"]["home/.claude-ag-settings.json"]:
+        if claude_key is None:
+            raise SyncError("Claude gateway API key is required")
+        settings = claude_launcher_settings(gateway, claude_key, claude_models)
+        writes["home/.claude-ag-settings.json"] = (json.dumps(settings, indent=2, ensure_ascii=False) + "\n").encode()
+        changes["home/.claude-ag-settings.json"] = ["new launcher settings (values hidden)"]
+    for label, data, what in (("codex/api-key", codex_key, "Codex API key"), ("codex/models.json", catalog, "Codex model catalog")):
+        if not target["present"][label]:
+            if data is None:
+                raise SyncError(f"{what} is required")
+            writes[label] = data
+            changes[label] = ["content (values hidden)"]
+    old = decode(target["files"]["codex/config.toml"]) if "codex/config.toml" in target["files"] else b""
+    config = parse_config("codex/config.toml", old) if old else {}
+    if provider not in config.get("model_providers", {}):
+        # Append instead of re-serializing so comments and key order survive.
+        block = toml_dump({"model_providers": {provider: {
+            "name": provider, "base_url": gateway + "/v1", "wire_api": "responses",
+            "auth": {"command": "/bin/cat", "args": [str(Path(location["codex"]) / "api-key")],
+                     "timeout_ms": 5000, "refresh_interval_ms": 0},
+        }}})
+        new = old + (b"" if not old or old.endswith(b"\n") else b"\n") + b"\n" + block
+        parse_config("codex/config.toml", new)
+        writes["codex/config.toml"] = new
+        changes["codex/config.toml"] = [f"model_providers.{provider}"]
+    rc = target["rc"]
+    text = decode(target["files"][rc]).decode() if rc in target["files"] else ""
+    lines = []
+    for name, command in launcher_aliases(provider, model).items():
+        # An existing alias of the same name is the user's choice; never override it.
+        if not re.search(rf"^\s*alias\s+{re.escape(name)}=", text, re.M):
+            lines.append(f"alias {name}={shlex.quote(command)}")
+            changes.setdefault(rc, []).append(f"alias {name}")
+    if lines:
+        prefix = "" if not text or text.endswith("\n") else "\n"
+        mark = "" if LAUNCHER_MARK in text else "\n" + LAUNCHER_MARK + "\n"
+        writes[rc] = (text + prefix + mark + "\n".join(lines) + "\n").encode()
+    return {
+        "writes": {k: encode(v) for k, v in writes.items()},
+        "expected": {k: digest(decode(target["files"][k])) if k in target["files"] else None for k in writes},
+        "changes": changes,
+    }
+
+
+VERIFY = {
+    "claude-ag": "claude-ag -p 'reply pong'",
+    "codex-ag": "codex-ag exec --skip-git-repo-check 'reply pong'",
+}
+
+
+def verify_launchers(home=None):
+    # Interactive shell: PATH and aliases often live only in the rc file.
+    shell = os.environ.get("SHELL") or "/bin/sh"
+    result = {}
+    for name, command in VERIFY.items():
+        try:
+            out = subprocess.run([shell, "-ic", command], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                 stderr=subprocess.DEVNULL, cwd=roots(home)["home"], timeout=240).stdout
+            # Report only pass/fail; launcher output may include configuration.
+            result[name] = bool(re.search(rb"^\s*pong\s*$", out, re.M | re.I))
+        except subprocess.TimeoutExpired:
+            result[name] = False
+    return result
+
+
 def worker(request):
     operation, home = request["operation"], request.get("home")
+    if operation == "inspect-launchers":
+        return inspect_launchers(home, request.get("gateways", []), request.get("provider", "astergate"))
+    if operation == "verify-launchers":
+        return verify_launchers(home)
     if operation == "inspect":
         return inspect(home, request.get("harness", "both"), request.get("secrets", False), request.get("api_key", False), request.get("catalog", True), request.get("model_refresh", False))
     if operation == "apply":
@@ -525,14 +689,14 @@ def ssh_args(endpoint):
     return args
 
 
-def call(endpoint, request, local_home=None):
+def call(endpoint, request, local_home=None, timeout=90):
     if endpoint == "local":
         return worker({**request, "home": local_home})
     # Only public source code is passed in argv; all configuration travels on stdin.
     script = Path(__file__).read_text()
     command = "python3 -c " + shlex.quote(script) + " --worker"
     try:
-        result = subprocess.run(ssh_args(endpoint) + [command], input=json.dumps(request).encode(), stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=90)
+        result = subprocess.run(ssh_args(endpoint) + [command], input=json.dumps(request).encode(), stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout)
     except subprocess.TimeoutExpired as e:
         raise SyncError("SSH operation timed out") from e
     try:
@@ -554,6 +718,69 @@ def show_plan(endpoint, plan):
         print(f"  {label}: " + ", ".join(keys))
 
 
+def launcher_inputs(args, needed):
+    """Read only the local secrets and catalog that some target is missing."""
+    location = roots(args.local_home)
+    home = Path(location["home"])
+    claude_key = codex_key = catalog = None
+    if "home/.claude-ag-settings.json" in needed:
+        claude_key = load_key(args.claude_api_key_env, args.claude_api_key_file)
+        if claude_key is None:
+            data = read_file(home / ".claude-ag-settings.json")
+            if data is None:
+                raise SyncError("no Claude gateway key: pass --claude-api-key-env or --claude-api-key-file")
+            value = parse_config("claude/settings.json", data).get("env", {}).get("ANTHROPIC_AUTH_TOKEN")
+            if not isinstance(value, str) or not value.strip():
+                raise SyncError("local ~/.claude-ag-settings.json has no ANTHROPIC_AUTH_TOKEN")
+            claude_key = value.strip()
+    if "codex/api-key" in needed:
+        codex_key = load_key(args.codex_api_key_env, args.codex_api_key_file or str(Path(location["codex"]) / "api-key"))
+        codex_key = (codex_key + "\n").encode()
+    if "codex/models.json" in needed:
+        path = args.codex_catalog
+        if not path:
+            data = read_file(Path(location["codex"]) / "config.toml")
+            path = parse_config("codex/config.toml", data).get("model_catalog_json") if data else None
+        if not path:
+            raise SyncError("no model catalog: pass --codex-catalog")
+        catalog = read_file(Path(path).expanduser())
+        if catalog is None:
+            raise SyncError("model catalog does not exist")
+        try:
+            json.loads(catalog)
+        except ValueError as e:
+            raise SyncError("invalid model catalog JSON") from e
+    return claude_key, codex_key, catalog
+
+
+def launchers(args):
+    targets = list(dict.fromkeys(args.targets))
+    request = {"operation": "inspect-launchers", "gateways": args.gateway, "provider": args.codex_provider}
+    found = [(t, call(t, request, args.local_home)) for t in targets]
+    needed = {label for _, state in found for label, ok in state["present"].items() if not ok}
+    claude_key, codex_key, catalog = launcher_inputs(args, needed)
+    plans = []
+    # Preflight every target before the first write, as sync does.
+    for target, state in found:
+        plan = build_launcher_plan(state, claude_key, codex_key, catalog, args.codex_provider, args.codex_model)
+        print(f"{target}: gateway {state['gateway'].rstrip('/')}, aliases in ~/{state['rc'].split('/', 1)[1]}")
+        show_plan(target, plan)
+        plans.append((target, plan))
+    if not args.apply:
+        print("Preview only. Add --apply to write changes.")
+        return 0
+    for target, plan in plans:
+        result = call(target, {"operation": "apply", "plan": plan}, args.local_home)
+        print(f"{target}: updated {len(result['updated'])} file(s); backup: {result['backup'] or 'none needed'}")
+    failed = False
+    if args.verify:
+        for target, _ in plans:
+            result = call(target, {"operation": "verify-launchers"}, args.local_home, timeout=600)
+            print(f"{target}: " + ", ".join(f"{k} {'pong' if ok else 'FAILED'}" for k, ok in result.items()))
+            failed = failed or not all(result.values())
+    return 1 if failed else 0
+
+
 def cli(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--version", action="version", version=__version__)
@@ -570,6 +797,19 @@ def cli(argv=None):
         group.add_argument("--" + prefix + "api-key-env", metavar="VAR", help=f"read a custom {name} API key from a local environment variable")
         group.add_argument("--" + prefix + "api-key-file", metavar="PATH", help=f"read a custom {name} API key from a local private file")
     sync.add_argument("--apply", action="store_true", help="write changes with an automatic backup")
+    launch = sub.add_parser("launchers", help="add claude-ag / codex-ag shell aliases wired to a gateway")
+    launch.add_argument("--to", dest="targets", action="append", required=True)
+    launch.add_argument("--gateway", action="append", required=True, metavar="URL",
+                        help="gateway base URL; repeat in preference order, each target uses the first it can reach")
+    launch.add_argument("--codex-provider", default="astergate", help="Codex model_providers entry name (default: astergate)")
+    launch.add_argument("--codex-model", default="gpt-6.1-sol")
+    launch.add_argument("--codex-catalog", metavar="PATH", help="model catalog for targets without one (default: local model_catalog_json)")
+    for name, default in (("claude", "env.ANTHROPIC_AUTH_TOKEN of ~/.claude-ag-settings.json"), ("codex", "~/.codex/api-key")):
+        group = launch.add_mutually_exclusive_group()
+        group.add_argument(f"--{name}-api-key-env", metavar="VAR", help=f"gateway key for {name} (default: {default})")
+        group.add_argument(f"--{name}-api-key-file", metavar="PATH")
+    launch.add_argument("--apply", action="store_true", help="write changes with an automatic backup")
+    launch.add_argument("--verify", action="store_true", help="run each launcher once in an interactive shell and expect pong")
     backups = sub.add_parser("backups", help="list backup IDs on a machine")
     backups.add_argument("--target", default="local")
     restore = sub.add_parser("restore", help="preview or restore a backup (creates an undo backup)")
@@ -608,6 +848,8 @@ def cli(argv=None):
                     print("Explicit API key overrides selected; other supported credentials stay on each target.")
                 else:
                     print("Credentials stay on each target. Use --with-secrets to transfer supported credentials.")
+        elif args.command == "launchers":
+            return launchers(args)
         elif args.command == "backups":
             for backup in call(args.target, {"operation": "backups"}, args.local_home):
                 print(backup)

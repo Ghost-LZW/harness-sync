@@ -75,6 +75,39 @@ harness-sync sync --to devbox --harness codex --with-model-refresh --apply
 
 脚本和入口支持自动备份与恢复，不带 `--with-model-refresh` 时保持原样；不会添加定时任务或修改 shell 配置。不同 Codex 版本请求模型列表时可能获得不同结果。
 
+## 网关启动别名
+
+`launchers` 在每台机器上加两个 shell alias，接到同一个兼容 Anthropic / OpenAI 的网关，不改 Codex 默认 provider 和 Claude 默认配置：
+
+```sh
+# 预览；每台目标机使用第一个能拿到 HTTP 响应的网关（例如先 IPv4 后 IPv6）
+harness-sync launchers --to devbox --to gpu-box \
+  --gateway http://10.0.0.5:8080 --gateway 'http://[fd00::5]:8080'
+
+# 写入，然后在交互 shell 里各跑一次，期望回 pong
+harness-sync launchers --to devbox --to gpu-box \
+  --gateway http://10.0.0.5:8080 --gateway 'http://[fd00::5]:8080' --apply --verify
+```
+
+- `claude-ag`：`claude --dangerously-skip-permissions --settings ~/.claude-ag-settings.json`
+- `codex-ag`：`codex -c model_provider=astergate -c model=gpt-6.1-sol -c model_catalog_json="$HOME/.codex/models.json"`
+
+只补缺失的部分：
+
+- alias 写到登录 shell 对应的 `~/.zshrc` 或 `~/.bashrc`，已有同名 alias 不动。
+- `~/.claude-ag-settings.json` 不存在时创建，内容是所选网关、bypass 权限模式，以及模型映射：
+  - 默认 / opus / fable：`claude-opus-5-5`
+  - sonnet 和 subagent：`dsv41-flash-uncensored[1m]`
+  - haiku 和后台任务：`glm-5.3[1m]`
+
+  已有的文件或软链保持原样。
+- `~/.codex/config.toml` 里没有 `model_providers.<name>`（默认 `astergate`）时追加一段；追加方式会保留注释，key 从 `~/.codex/api-key` 读取。
+- `~/.codex/api-key`、`~/.codex/models.json` 只复制到缺少它们的机器。
+
+只有目标缺少时，才会在本机读取 key 和模型列表。Claude key 默认取本机 `~/.claude-ag-settings.json` 的 `env.ANTHROPIC_AUTH_TOKEN`，Codex key 默认取 `~/.codex/api-key`，模型列表默认取本机 `model_catalog_json`；都可以用参数覆盖。
+
+`codex-ag` 用 `-c` 而不是 `--profile`：Codex 0.166+ 在 `config.toml` 里还有 `[profiles.*]` 时会拒绝 `--profile`。模型列表要能被目标机的 Codex 版本解析，0.133 这类旧版本不认识 `max` 等新的推理强度。`--verify` 通过 `$SHELL -ic` 运行，因为 PATH 常常只在交互 rc 里设置；每个启动别名只输出 pong 或 FAILED。所有改动和其他命令一样自动备份、可恢复。
+
 ## 同步范围与恢复
 
 同步模型、推理强度、service tier、provider、权限、沙箱、环境默认值等设置；源端没有的旧默认项会从目标中移除。源端的宽松权限和沙箱设置也会同步，请先查看预览。

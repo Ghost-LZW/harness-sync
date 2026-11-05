@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.3.0
+
+- Add `launchers` to install `claude-ag` / `codex-ag` shell aliases wired to a gateway, choosing per machine the first `--gateway` that answers HTTP (e.g. IPv4, then IPv6).
+- Create only what is missing: Claude launcher settings (opus `claude-opus-5-5`, sonnet/subagents `dsv41-flash-uncensored[1m]`, haiku `glm-5.3[1m]`, bypass permissions), the Codex provider entry, API key, and model catalog. Existing aliases, settings, and default providers stay untouched.
+- Add `--verify` to run each launcher once in an interactive shell and expect `pong`.
+- Keep shell rc file permissions on write; launcher changes are backed up and restorable.
+
 ## 0.2.0
 
 - Add `--with-model-refresh` to copy a trusted Codex `refresh-models.py`.
