@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- Refuse a Claude sync that would remove the target's `env.ANTHROPIC_BASE_URL`; `--allow-gateway-drop` opts out.
+- Require a source `ANTHROPIC_BASE_URL` when a custom Claude API key is selected.
+
 ## 0.2.0
 
 - Add `--with-model-refresh` to copy a trusted Codex `refresh-models.py`.

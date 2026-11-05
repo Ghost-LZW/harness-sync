@@ -45,6 +45,8 @@ harness-sync sync --to ssh://alice@server.example.com:2222 --apply
 
 `--harness codex` or `--harness claude` limits the sync to one harness. Repeating `--to` applies one source to multiple destinations. All destinations are inspected and planned before the first write. A failed destination does not undo successful updates on earlier destinations.
 
+A Claude sync stops before writing anything when the source settings have no `env.ANTHROPIC_BASE_URL` but a target has one, because the target would otherwise fall back to the default API. Pass `--allow-gateway-drop` if that is intended. A custom Claude API key always requires a source `ANTHROPIC_BASE_URL`, so the key is never sent to an unintended endpoint.
+
 ## Choose your own API key
 
 Supply keys through an environment variable or private file. No literal API-key argument is provided, so keys do not end up in process arguments or shell history. The tool reads these inputs on the computer running it, even when `--from` points to an SSH machine.

@@ -37,6 +37,8 @@ harness-sync sync --to ssh://alice@server.example.com:2222 --apply
 
 `local` 表示运行本工具的机器。SSH 别名、密钥、agent 和跳板机沿用系统 SSH 配置；连接使用批处理模式，请先确保可以通过 SSH 登录。`--harness codex` 或 `--harness claude` 可以只同步一个工具。
 
+如果源机器的 Claude 配置没有 `env.ANTHROPIC_BASE_URL`，而目标机器有，同步会在写入前停下，否则目标会退回默认 API。确实要这样做时加 `--allow-gateway-drop`。使用自定义 Claude API key 时，源配置必须带 `ANTHROPIC_BASE_URL`，避免把 key 发到别的地址。
+
 ## 自定义 API key
 
 可以给两个工具共用一个 key，也可以分别设置。从当前机器上的环境变量或私有文件读取；不提供把 key 明文放进命令参数的接口。
