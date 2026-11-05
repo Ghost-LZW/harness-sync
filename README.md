@@ -41,7 +41,7 @@ harness-sync sync --from devbox --to staging --harness codex --apply
 harness-sync sync --to ssh://alice@server.example.com:2222 --apply
 ```
 
-`local` means the computer running the tool. Other endpoints are SSH aliases, `user@host`, or `ssh://user@host:port`. Your normal SSH config, keys, agent, and jump hosts apply. Connections use batch mode; establish SSH access first. No shell profile, SSH configuration, or CLI installation is modified.
+`local` means the computer running the tool. Other endpoints are SSH aliases, `user@host`, or `ssh://user@host:port`. Your normal SSH config, keys, agent, and jump hosts apply. Connections use batch mode; establish SSH access first. `sync` modifies no shell profile, SSH configuration, or CLI installation; only `launchers` (below) appends aliases to a shell rc file.
 
 `--harness codex` or `--harness claude` limits the sync to one harness. Repeating `--to` applies one source to multiple destinations. All destinations are inspected and planned before the first write. A failed destination does not undo successful updates on earlier destinations.
 
@@ -94,6 +94,44 @@ This copies `refresh-models.py` byte-for-byte into the target's Codex directory 
 This is an explicit code-transfer option: inspect and trust the source script. No refresh script is bundled or executed by `harness-sync`; it runs later when you use the launcher. The script must be portable and compatible with the target's provider, credentials, Python, and CLI installation. Its own return code controls launch behavior: zero starts Codex, nonzero stops. A script that returns zero after retaining a valid cached catalog can allow startup when discovery is temporarily unavailable.
 
 The source must select `model_catalog_json`, and Codex must already be installed on the target. Credentials are still opt-in through `--with-secrets` or custom-key options. The source script is required, not an existing source launcher: each destination launcher is generated for that machine. Script and launcher updates are backed up and restored like configuration files. Omit `--with-model-refresh` to leave them alone; this option does not add cron jobs or modify shell profiles. Model lists may differ between CLI versions when the refresh script requests a version-specific catalog.
+
+## Gateway launchers
+
+`launchers` adds two shell aliases on each machine, wired to an Anthropic- and OpenAI-compatible gateway, without changing the default Codex provider or Claude settings:
+
+```sh
+# Preview. Each target uses the first gateway it gets an HTTP reply from.
+harness-sync launchers --to devbox --to gpu-box \
+  --gateway http://10.0.0.5:8080 --gateway 'http://[fd00::5]:8080'
+
+# Write, then run both launchers once in an interactive shell and expect "pong".
+harness-sync launchers --to devbox --to gpu-box \
+  --gateway http://10.0.0.5:8080 --gateway 'http://[fd00::5]:8080' --apply --verify
+```
+
+| Alias | Runs |
+| --- | --- |
+| `claude-ag` | `claude --dangerously-skip-permissions --settings ~/.claude-ag-settings.json` |
+| `codex-ag` | `codex -c model_provider=astergate -c model=gpt-6.1-sol -c model_catalog_json="$HOME/.codex/models.json"` |
+
+Only what is missing gets added:
+
+- The aliases go in `~/.zshrc` when the login shell is zsh, otherwise in `~/.bashrc`. An existing alias with the same name is left untouched.
+- `~/.claude-ag-settings.json` is created when absent: the chosen gateway, bypass-permission mode, and this model mapping:
+
+  | Claude Code slot | Model |
+  | --- | --- |
+  | default, opus, fable | `claude-opus-5-5` |
+  | sonnet, subagents | `dsv41-flash-uncensored[1m]` |
+  | haiku, background tasks | `glm-5.3[1m]` |
+
+  An existing file or symlink is kept as is.
+- A `model_providers.<name>` entry (`--codex-provider`, default `astergate`) is appended to `~/.codex/config.toml` when absent. Appending preserves comments and key order. It reads the key from `~/.codex/api-key`.
+- `~/.codex/api-key` and `~/.codex/models.json` are copied only to machines without them.
+
+Keys are read on this computer only when some target needs them. The Claude key defaults to `env.ANTHROPIC_AUTH_TOKEN` in the local `~/.claude-ag-settings.json` (override with `--claude-api-key-env` or `--claude-api-key-file`). The Codex key defaults to `~/.codex/api-key` (`--codex-api-key-env` / `--codex-api-key-file`). The catalog defaults to the local `model_catalog_json` (`--codex-catalog`).
+
+`codex-ag` uses `-c` overrides rather than `--profile`, because Codex 0.166+ refuses `--profile` while `config.toml` still contains a `[profiles.*]` table. The catalog must parse with the target's Codex version; older releases such as 0.133 reject newer reasoning-effort values like `max`. `--verify` runs the aliases through `$SHELL -ic`, because PATH often lives only in the interactive rc. It prints only pong or FAILED per launcher. Changes are backed up and restorable like any other update.
 
 ## What gets synchronized
 

@@ -303,6 +303,106 @@ class SyncTests(unittest.TestCase):
         self.assertEqual(tomllib.loads(hs.toml_dump(data).decode()), data)
 
 
+class LauncherTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.home = Path(self.temp.name) / "home"
+        (self.home / ".codex").mkdir(parents=True)
+        self.rc = self.home / ".zshrc"
+        self.rc.write_text("# user rc\nalias ll='ls -l'\n")
+        self.rc.chmod(0o644)
+        (self.home / ".codex/config.toml").write_text('# keep me\nmodel_provider = "other"\n\n[model_providers.other]\nbase_url = "https://other.test/v1"\n')
+        env = patch.dict(os.environ, {"SHELL": "/bin/zsh"})
+        env.start()
+        self.addCleanup(env.stop)
+        reach = patch.object(hs, "reachable", side_effect=lambda url: "10.0.0.1" not in url)
+        reach.start()
+        self.addCleanup(reach.stop)
+
+    def state(self):
+        return hs.inspect_launchers(str(self.home), ["http://10.0.0.1:8080", "http://[fd00::1]:8080"])
+
+    def plan(self, state=None):
+        return hs.build_launcher_plan(state or self.state(), "fixture-claude-key", b"fixture-codex-key\n", b'{"models": []}')
+
+    def test_first_reachable_gateway_and_full_install(self):
+        state = self.state()
+        self.assertEqual(state["gateway"], "http://[fd00::1]:8080")
+        self.assertEqual(state["rc"], "shell/.zshrc")
+        hs.apply_plan(self.plan(state), str(self.home))
+        settings = json.loads((self.home / ".claude-ag-settings.json").read_text())
+        env = settings["env"]
+        self.assertEqual(env["ANTHROPIC_BASE_URL"], "http://[fd00::1]:8080")
+        self.assertEqual(env["ANTHROPIC_MODEL"], "claude-opus-5-5")
+        self.assertEqual(env["ANTHROPIC_DEFAULT_SONNET_MODEL"], "dsv41-flash-uncensored[1m]")
+        self.assertEqual(env["CLAUDE_CODE_SUBAGENT_MODEL"], "dsv41-flash-uncensored[1m]")
+        self.assertEqual(env["ANTHROPIC_SMALL_FAST_MODEL"], "glm-5.3[1m]")
+        self.assertEqual(settings["permissions"]["defaultMode"], "bypassPermissions")
+        config_text = (self.home / ".codex/config.toml").read_text()
+        self.assertTrue(config_text.startswith("# keep me\n"))
+        config = tomllib.loads(config_text)
+        self.assertEqual(config["model_provider"], "other")
+        self.assertEqual(config["model_providers"]["astergate"]["base_url"], "http://[fd00::1]:8080/v1")
+        self.assertEqual(config["model_providers"]["astergate"]["auth"]["args"], [str(self.home / ".codex/api-key")])
+        rc = self.rc.read_text()
+        self.assertTrue(rc.startswith("# user rc\nalias ll='ls -l'\n"))
+        self.assertIn("alias claude-ag='claude --dangerously-skip-permissions --settings ~/.claude-ag-settings.json'", rc)
+        self.assertIn("alias codex-ag='codex -c model_provider=astergate -c model=gpt-6.1-sol", rc)
+        self.assertEqual(self.rc.stat().st_mode & 0o777, 0o644)
+        self.assertEqual((self.home / ".codex/api-key").stat().st_mode & 0o777, 0o600)
+        # Second run is a no-op.
+        self.assertEqual(self.plan()["writes"], {})
+
+    def test_existing_alias_settings_and_provider_are_kept(self):
+        self.rc.write_text("alias claude-ag='my-own-claude'\n")
+        (self.home / ".claude-ag-settings.json").symlink_to(self.home / "elsewhere.json")
+        with (self.home / ".codex/config.toml").open("a") as f:
+            f.write('\n[model_providers.astergate]\nbase_url = "http://kept.test/v1"\n')
+        (self.home / ".codex/api-key").write_text("existing\n")
+        (self.home / ".codex/models.json").write_text("{}")
+        # No secrets needed when the target already has everything but one alias.
+        plan = hs.build_launcher_plan(self.state())
+        self.assertEqual(sorted(plan["writes"]), ["shell/.zshrc"])
+        self.assertEqual(plan["changes"]["shell/.zshrc"], ["alias codex-ag"])
+        self.assertIn("alias claude-ag='my-own-claude'\n", hs.decode(plan["writes"]["shell/.zshrc"]).decode())
+
+    def test_missing_inputs_and_unreachable_gateways_fail(self):
+        with self.assertRaisesRegex(hs.SyncError, "Claude gateway API key"):
+            hs.build_launcher_plan(self.state())
+        state = hs.inspect_launchers(str(self.home), ["http://10.0.0.1:8080"])
+        with self.assertRaisesRegex(hs.SyncError, "no gateway"):
+            self.plan(state)
+
+    def test_bash_rc_and_sync_never_reads_rc(self):
+        with patch.dict(os.environ, {"SHELL": "/bin/bash"}):
+            self.assertEqual(self.state()["rc"], "shell/.bashrc")
+        self.assertFalse(set(hs.inspect(str(self.home))["files"]) & hs.LAUNCHER_FILES)
+
+    def test_restore_undoes_launcher_install(self):
+        before = self.rc.read_text()
+        result = hs.apply_plan(self.plan(), str(self.home))
+        hs.apply_plan(hs.restore_plan(result["backup"], str(self.home)), str(self.home))
+        self.assertEqual(self.rc.read_text(), before)
+        self.assertFalse((self.home / ".claude-ag-settings.json").exists())
+
+
+class ReachableTests(unittest.TestCase):
+    def test_needs_an_http_reply_not_just_a_tcp_accept(self):
+        import http.server
+        import socket
+        import threading
+        server = http.server.HTTPServer(("127.0.0.1", 0), http.server.BaseHTTPRequestHandler)
+        self.addCleanup(server.server_close)
+        threading.Thread(target=server.handle_request, daemon=True).start()
+        self.assertTrue(hs.reachable(f"http://127.0.0.1:{server.server_port}"))  # 501 still counts
+        silent = socket.socket()
+        self.addCleanup(silent.close)
+        silent.bind(("127.0.0.1", 0))
+        silent.listen()
+        self.assertFalse(hs.reachable(f"http://127.0.0.1:{silent.getsockname()[1]}", timeout=1))
+
+
 def shlex_split(command):
     import shlex
     return shlex.split(command)
