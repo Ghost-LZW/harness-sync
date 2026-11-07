@@ -47,6 +47,8 @@ harness-sync sync --to ssh://alice@server.example.com:2222 --apply
 
 A Claude sync stops before writing anything when the source settings have no `env.ANTHROPIC_BASE_URL` but a target has one, because the target would otherwise fall back to the default API. Pass `--allow-gateway-drop` if that is intended. A custom Claude API key always requires a source `ANTHROPIC_BASE_URL`, so the key is never sent to an unintended endpoint.
 
+A Codex sync keeps the target's `base_url` for every `model_providers` entry that both machines define, because machines often reach the same gateway by different routes (for example IPv4 on one and IPv6 on another). The preview lists each kept provider by name as `kept target base_url for model_providers.<name>`. Pass `--overwrite-base-url` to write the source value instead. A provider the target does not have yet, or has without a `base_url`, gets the source value.
+
 ## Choose your own API key
 
 Supply keys through an environment variable or private file. No literal API-key argument is provided, so keys do not end up in process arguments or shell history. The tool reads these inputs on the computer running it, even when `--from` points to an SSH machine.
@@ -141,7 +143,7 @@ The source controls portable defaults. Stale portable settings on the target are
 
 | Configuration | Synced | Kept on each target |
 | --- | --- | --- |
-| Codex `config.toml` | Model, reasoning effort, service tier, provider definitions, approval/sandbox defaults, portable features, profiles, other defaults | `projects`, `desktop`, `marketplaces`, `plugins`, `mcp_servers`, `hooks`, `notify`, `tui`; the hooks feature switch |
+| Codex `config.toml` | Model, reasoning effort, service tier, provider definitions, approval/sandbox defaults, portable features, profiles, other defaults | `projects`, `desktop`, `marketplaces`, `plugins`, `mcp_servers`, `hooks`, `notify`, `tui`; the hooks feature switch; the `base_url` of providers the target already defines, unless `--overwrite-base-url` |
 | Claude `settings.json` | Model, model settings, environment defaults, permissions, UI/update preferences, other defaults | `hooks`, `enabledPlugins`, `extraKnownMarketplaces`, `skillOverrides` |
 | Codex model catalog | The JSON file referenced by `model_catalog_json`, normalized to `models.json` on the destination | Unreferenced catalogs |
 | Codex refresh helper | Source `refresh-models.py` and a generated `codex-with-models` launcher only with `--with-model-refresh` | Existing helpers when the flag is omitted |

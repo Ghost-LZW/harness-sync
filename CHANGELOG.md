@@ -1,7 +1,8 @@
 # Changelog
 
-## Unreleased
+## 0.4.0
 
+- Keep the target's `base_url` for Codex `model_providers` entries that both machines define, and report it in the preview as `kept target base_url`; `--overwrite-base-url` writes the source value. Providers new to the target still get the source value.
 - Refuse a Claude sync that would remove the target's `env.ANTHROPIC_BASE_URL`; `--allow-gateway-drop` opts out.
 - Require a source `ANTHROPIC_BASE_URL` when a custom Claude API key is selected.
 
