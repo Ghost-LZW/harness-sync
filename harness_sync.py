@@ -248,7 +248,22 @@ def inspect(home=None, harness="both", secrets=False, api_key=False, catalog=Tru
     return result
 
 
-def build_plan(source, target, harness="both", secrets=False, api_keys=None, model_refresh=False):
+def check_claude_gateway(new, old, custom_key, allow_gateway_drop):
+    """Refuse Claude settings that would silently point the target at the default API."""
+    if (new.get("env") or {}).get("ANTHROPIC_BASE_URL"):
+        return
+    if custom_key:
+        # Never send a gateway key to whatever endpoint Claude falls back to.
+        raise SyncError("a custom Claude API key requires env.ANTHROPIC_BASE_URL in the source settings")
+    if (old.get("env") or {}).get("ANTHROPIC_BASE_URL") and not allow_gateway_drop:
+        raise SyncError(
+            "source Claude settings have no env.ANTHROPIC_BASE_URL but the target does; "
+            "syncing would remove the target's gateway (use --allow-gateway-drop to proceed)"
+        )
+
+
+def build_plan(source, target, harness="both", secrets=False, api_keys=None, model_refresh=False,
+               allow_gateway_drop=False):
     api_keys = api_keys or {}
     writes, changes = {}, {}
     for name, label in (("codex", "codex/config.toml"), ("claude", "claude/settings.json")):
@@ -291,6 +306,8 @@ def build_plan(source, target, harness="both", secrets=False, api_keys=None, mod
                 env.pop("ANTHROPIC_API_KEY", None)
                 env["ANTHROPIC_AUTH_TOKEN"] = api_keys[name]
                 new.pop("apiKeyHelper", None)
+        if name == "claude":
+            check_claude_gateway(new, old, name in api_keys, allow_gateway_drop)
         excluded = MACHINE_CODEX if name == "codex" else MACHINE_CLAUDE
         new.update({k: v for k, v in old.items() if k in excluded})
         # Hooks remain target-local, including their trust state and feature switch.
@@ -796,6 +813,7 @@ def cli(argv=None):
         group = sync.add_mutually_exclusive_group()
         group.add_argument("--" + prefix + "api-key-env", metavar="VAR", help=f"read a custom {name} API key from a local environment variable")
         group.add_argument("--" + prefix + "api-key-file", metavar="PATH", help=f"read a custom {name} API key from a local private file")
+    sync.add_argument("--allow-gateway-drop", action="store_true", help="allow a source without env.ANTHROPIC_BASE_URL to remove the target's Claude gateway")
     sync.add_argument("--apply", action="store_true", help="write changes with an automatic backup")
     launch = sub.add_parser("launchers", help="add claude-ag / codex-ag shell aliases wired to a gateway")
     launch.add_argument("--to", dest="targets", action="append", required=True)
@@ -834,7 +852,10 @@ def cli(argv=None):
             # Preflight every target before the first write. Each target is transactional.
             for target in targets:
                 destination = call(target, {**request, "catalog": False}, args.local_home)
-                plan = build_plan(source, destination, args.harness, args.with_secrets, api_keys, args.with_model_refresh)
+                plan = build_plan(
+                    source, destination, args.harness, args.with_secrets, api_keys, args.with_model_refresh,
+                    args.allow_gateway_drop,
+                )
                 show_plan(target, plan)
                 plans.append((target, plan))
             if args.apply:

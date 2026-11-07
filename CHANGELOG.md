@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- Refuse a Claude sync that would remove the target's `env.ANTHROPIC_BASE_URL`; `--allow-gateway-drop` opts out.
+- Require a source `ANTHROPIC_BASE_URL` when a custom Claude API key is selected.
+
 ## 0.3.0
 
 - Add `launchers` to install `claude-ag` / `codex-ag` shell aliases wired to a gateway, choosing per machine the first `--gateway` that answers HTTP (e.g. IPv4, then IPv6).

@@ -109,6 +109,32 @@ class SyncTests(unittest.TestCase):
         plan = self.plan(secrets=True, keys={"codex": "fixture-override"})
         self.assertEqual(hs.decode(plan["writes"]["codex/api-key"]), b"fixture-override\n")
 
+    def test_claude_gateway_is_not_silently_dropped(self):
+        source = json.loads(hs.file_path("claude/settings.json", hs.roots(str(self.source))).read_text())
+        del source["env"]["ANTHROPIC_BASE_URL"]
+        self.put(self.source, "claude/settings.json", source)
+        target = json.loads(hs.file_path("claude/settings.json", hs.roots(str(self.target))).read_text())
+        target["env"]["ANTHROPIC_BASE_URL"] = "https://target-gateway.example.test"
+        self.put(self.target, "claude/settings.json", target)
+        with self.assertRaisesRegex(hs.SyncError, "allow-gateway-drop") as raised:
+            self.plan()
+        self.assertNotIn("target-gateway.example.test", str(raised.exception))
+        # Codex alone never touches Claude settings.
+        hs.build_plan(self.snapshot(self.source), self.snapshot(self.target), harness="codex")
+        plan = hs.build_plan(self.snapshot(self.source), self.snapshot(self.target), allow_gateway_drop=True)
+        self.assertNotIn("ANTHROPIC_BASE_URL", self.read_plan(plan, "claude/settings.json")["env"])
+
+    def test_custom_claude_key_requires_a_gateway(self):
+        source = json.loads(hs.file_path("claude/settings.json", hs.roots(str(self.source))).read_text())
+        del source["env"]["ANTHROPIC_BASE_URL"]
+        self.put(self.source, "claude/settings.json", source)
+        for allow in (False, True):
+            with self.assertRaisesRegex(hs.SyncError, "custom Claude API key"):
+                hs.build_plan(
+                    self.snapshot(self.source), self.snapshot(self.target),
+                    api_keys={"claude": "fixture-custom-claude"}, allow_gateway_drop=allow,
+                )
+
     def test_env_and_file_key_sources_and_override_precedence(self):
         keyfile = Path(self.temp.name) / "fixture-key"
         keyfile.write_text("fixture-file-key\n")
