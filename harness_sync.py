@@ -752,11 +752,13 @@ def show_plan(endpoint, plan):
     print(f"{endpoint}:")
     if not plan["changes"]:
         print("  already in sync")
-    for label, keys in sorted(plan["changes"].items()):
-        print(f"  {label}: " + ", ".join(keys))
-    for label, providers in sorted(plan.get("kept", {}).items()):
-        print(f"  {label}: kept target base_url for " + ", ".join(providers)
-              + " (source differs; --overwrite-base-url uses the source value)")
+    kept = plan.get("kept", {})
+    for label in sorted(set(plan["changes"]) | set(kept)):
+        if label in plan["changes"]:
+            print(f"  {label}: " + ", ".join(plan["changes"][label]))
+        if label in kept:
+            print(f"  {label}: kept target base_url for " + ", ".join(kept[label])
+                  + " (source differs; --overwrite-base-url uses the source value)")
 
 
 def launcher_inputs(args, needed):
