@@ -135,6 +135,75 @@ class SyncTests(unittest.TestCase):
                     api_keys={"claude": "fixture-custom-claude"}, allow_gateway_drop=allow,
                 )
 
+    def target_provider(self, provider):
+        config = tomllib.loads((self.target / ".codex/config.toml").read_text())
+        config["model_providers"] = {"example": provider}
+        self.put(self.target, "codex/config.toml", config)
+
+    def test_codex_target_base_url_is_kept_by_default(self):
+        self.target_provider({"base_url": "http://[fd00::5]:8080/v1", "wire_api": "responses"})
+        plan = self.plan()
+        codex = self.read_plan(plan, "codex/config.toml")
+        self.assertEqual(codex["model_providers"]["example"]["base_url"], "http://[fd00::5]:8080/v1")
+        self.assertEqual(codex["model_providers"]["example"]["auth"]["args"], [str(self.target / ".codex/api-key")])
+        self.assertNotIn("model_providers.example.base_url", plan["changes"]["codex/config.toml"])
+        self.assertEqual(plan["kept"], {"codex/config.toml": ["model_providers.example"]})
+        stream = io.StringIO()
+        with contextlib.redirect_stdout(stream):
+            hs.show_plan("example-ssh-alias", plan)
+        self.assertIn("codex/config.toml: kept target base_url for model_providers.example", stream.getvalue())
+        for value in ("fd00::5", "gateway.example.test"):
+            self.assertNotIn(value, stream.getvalue())
+        # Once synced, nothing is written but the kept endpoint is still reported.
+        hs.apply_plan(plan, str(self.target))
+        plan = self.plan()
+        self.assertEqual(plan["writes"], {})
+        self.assertEqual(plan["kept"], {"codex/config.toml": ["model_providers.example"]})
+
+    def test_overwrite_base_url_uses_the_source_value(self):
+        self.target_provider({"base_url": "http://[fd00::5]:8080/v1", "wire_api": "responses"})
+        plan = hs.build_plan(self.snapshot(self.source), self.snapshot(self.target), overwrite_base_url=True)
+        codex = self.read_plan(plan, "codex/config.toml")
+        self.assertEqual(codex["model_providers"]["example"]["base_url"], "https://gateway.example.test/v1")
+        self.assertIn("model_providers.example.base_url", plan["changes"]["codex/config.toml"])
+        self.assertEqual(plan["kept"], {})
+
+    def test_source_base_url_is_written_when_the_target_has_none(self):
+        # First no provider at all, then a same-name provider without base_url.
+        for provider in (None, {"wire_api": "responses"}):
+            if provider is not None:
+                self.target_provider(provider)
+            plan = self.plan()
+            codex = self.read_plan(plan, "codex/config.toml")
+            self.assertEqual(codex["model_providers"]["example"]["base_url"], "https://gateway.example.test/v1")
+            self.assertEqual(plan["kept"], {})
+
+    def test_source_provider_without_base_url_keeps_the_target_value(self):
+        source = tomllib.loads((self.source / ".codex/config.toml").read_text())
+        del source["model_providers"]["example"]["base_url"]
+        self.put(self.source, "codex/config.toml", source)
+        self.target_provider({"base_url": "http://[fd00::5]:8080/v1"})
+        plan = self.plan()
+        self.assertEqual(self.read_plan(plan, "codex/config.toml")["model_providers"]["example"]["base_url"], "http://[fd00::5]:8080/v1")
+        self.assertEqual(plan["kept"], {"codex/config.toml": ["model_providers.example"]})
+
+    def test_sync_preview_reports_kept_base_url_and_honors_overwrite(self):
+        self.target_provider({"base_url": "http://[fd00::5]:8080/v1", "wire_api": "responses"})
+        homes = {"local": self.source, "example-target": self.target}
+        def fake_call(endpoint, request, local_home=None, timeout=90):
+            return hs.worker({**request, "home": str(homes[endpoint])})
+        before = (self.target / ".codex/config.toml").read_bytes()
+        for extra, expected, absent in (
+            ([], "kept target base_url for model_providers.example", "model_providers.example.base_url"),
+            (["--overwrite-base-url"], "model_providers.example.base_url", "kept target base_url"),
+        ):
+            stream = io.StringIO()
+            with patch.object(hs, "call", side_effect=fake_call), contextlib.redirect_stdout(stream):
+                self.assertEqual(hs.cli(["sync", "--harness", "codex", "--to", "example-target", *extra]), 0)
+            self.assertIn(expected, stream.getvalue())
+            self.assertNotIn(absent, stream.getvalue())
+        self.assertEqual((self.target / ".codex/config.toml").read_bytes(), before)
+
     def test_env_and_file_key_sources_and_override_precedence(self):
         keyfile = Path(self.temp.name) / "fixture-key"
         keyfile.write_text("fixture-file-key\n")

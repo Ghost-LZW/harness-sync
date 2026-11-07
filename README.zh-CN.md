@@ -39,6 +39,8 @@ harness-sync sync --to ssh://alice@server.example.com:2222 --apply
 
 如果源机器的 Claude 配置没有 `env.ANTHROPIC_BASE_URL`，而目标机器有，同步会在写入前停下，否则目标会退回默认 API。确实要这样做时加 `--allow-gateway-drop`。使用自定义 Claude API key 时，源配置必须带 `ANTHROPIC_BASE_URL`，避免把 key 发到别的地址。
 
+Codex 同步时，源和目标都有的 `model_providers` 条目保留目标自己的 `base_url`：不同机器常经不同路由连同一个网关（比如一台走 IPv4、一台走 IPv6）。预览会逐个列出 `kept target base_url for model_providers.<name>`。要改用源机器的值，加 `--overwrite-base-url`。目标还没有该 provider，或有但没写 `base_url` 时，照常写入源的值。
+
 ## 自定义 API key
 
 可以给两个工具共用一个 key，也可以分别设置。从当前机器上的环境变量或私有文件读取；不提供把 key 明文放进命令参数的接口。

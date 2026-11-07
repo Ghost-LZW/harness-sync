@@ -21,7 +21,7 @@ import tomllib
 import uuid
 from urllib.parse import urlsplit
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 MAX_FILE = 16 * 1024 * 1024
 MACHINE_CODEX = {
     "projects", "desktop", "marketplaces", "plugins", "mcp_servers",
@@ -262,10 +262,26 @@ def check_claude_gateway(new, old, custom_key, allow_gateway_drop):
         )
 
 
+def keep_target_base_urls(new, old):
+    """Keep target provider endpoints: machines can reach one gateway by different routes."""
+    kept = []
+    providers, current = new.get("model_providers"), old.get("model_providers")
+    if not isinstance(providers, dict) or not isinstance(current, dict):
+        return kept
+    for name, settings in providers.items():
+        before = current.get(name)
+        if not isinstance(settings, dict) or not isinstance(before, dict) or "base_url" not in before:
+            continue
+        if settings.get("base_url") != before["base_url"]:
+            settings["base_url"] = before["base_url"]
+            kept.append(f"model_providers.{name}")
+    return kept
+
+
 def build_plan(source, target, harness="both", secrets=False, api_keys=None, model_refresh=False,
-               allow_gateway_drop=False):
+               allow_gateway_drop=False, overwrite_base_url=False):
     api_keys = api_keys or {}
-    writes, changes = {}, {}
+    writes, changes, kept = {}, {}, {}
     for name, label in (("codex", "codex/config.toml"), ("claude", "claude/settings.json")):
         if harness not in ("both", name):
             continue
@@ -306,6 +322,10 @@ def build_plan(source, target, harness="both", secrets=False, api_keys=None, mod
                 env.pop("ANTHROPIC_API_KEY", None)
                 env["ANTHROPIC_AUTH_TOKEN"] = api_keys[name]
                 new.pop("apiKeyHelper", None)
+        if name == "codex" and not overwrite_base_url:
+            providers = keep_target_base_urls(new, old)
+            if providers:
+                kept[label] = providers
         if name == "claude":
             check_claude_gateway(new, old, name in api_keys, allow_gateway_drop)
         excluded = MACHINE_CODEX if name == "codex" else MACHINE_CLAUDE
@@ -371,6 +391,7 @@ def build_plan(source, target, harness="both", secrets=False, api_keys=None, mod
         "writes": {k: encode(v) for k, v in writes.items()},
         "expected": {k: digest(decode(target["files"][k])) if k in target["files"] else None for k in writes},
         "changes": changes,
+        "kept": kept,
     }
 
 
@@ -733,6 +754,9 @@ def show_plan(endpoint, plan):
         print("  already in sync")
     for label, keys in sorted(plan["changes"].items()):
         print(f"  {label}: " + ", ".join(keys))
+    for label, providers in sorted(plan.get("kept", {}).items()):
+        print(f"  {label}: kept target base_url for " + ", ".join(providers)
+              + " (source differs; --overwrite-base-url uses the source value)")
 
 
 def launcher_inputs(args, needed):
@@ -814,6 +838,7 @@ def cli(argv=None):
         group.add_argument("--" + prefix + "api-key-env", metavar="VAR", help=f"read a custom {name} API key from a local environment variable")
         group.add_argument("--" + prefix + "api-key-file", metavar="PATH", help=f"read a custom {name} API key from a local private file")
     sync.add_argument("--allow-gateway-drop", action="store_true", help="allow a source without env.ANTHROPIC_BASE_URL to remove the target's Claude gateway")
+    sync.add_argument("--overwrite-base-url", action="store_true", help="replace the base_url of Codex providers the target already has with the source value")
     sync.add_argument("--apply", action="store_true", help="write changes with an automatic backup")
     launch = sub.add_parser("launchers", help="add claude-ag / codex-ag shell aliases wired to a gateway")
     launch.add_argument("--to", dest="targets", action="append", required=True)
@@ -854,7 +879,7 @@ def cli(argv=None):
                 destination = call(target, {**request, "catalog": False}, args.local_home)
                 plan = build_plan(
                     source, destination, args.harness, args.with_secrets, api_keys, args.with_model_refresh,
-                    args.allow_gateway_drop,
+                    args.allow_gateway_drop, args.overwrite_base_url,
                 )
                 show_plan(target, plan)
                 plans.append((target, plan))
